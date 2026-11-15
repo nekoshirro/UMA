@@ -284,6 +284,7 @@ object NextJsData {
     private fun parseFlightPage(body: String, keys: Array<out String>): FlightPage? {
         val bytes = body.toByteArray(Charsets.UTF_8)
         val texts = HashMap<String, String>()
+        var matchedObject: JSONObject? = null
         var pos = 0
 
         while (pos < bytes.size) {
@@ -308,14 +309,16 @@ object NextJsData {
             val row = String(bytes, colon + 1, end - colon - 1, Charsets.UTF_8)
             pos = end + 1
 
-            // Cheap pre-filter: skip rows that don't even mention every key.
-            if (keys.any { "\"$it\":" !in row }) continue
+            if (matchedObject == null) {
+                // Cheap pre-filter: skip rows that don't even mention every key.
+                if (keys.any { "\"$it\":" !in row }) continue
 
-            val value = runCatching { JSONTokener(row).nextValue() }.getOrNull() ?: continue
-            findObjectByKeys(value, keys)?.let { return FlightPage(it, texts) }
+                val value = runCatching { JSONTokener(row).nextValue() }.getOrNull() ?: continue
+                matchedObject = findObjectByKeys(value, keys)
+            }
         }
 
-        return null
+        return matchedObject?.let { FlightPage(it, texts) }
     }
 
     /** Recursive search for an object containing every one of [keys]. */

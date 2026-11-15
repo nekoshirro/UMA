@@ -4,6 +4,7 @@ import tsuki.MangaLoaderContext
 import tsuki.MangaSourceParser
 import tsuki.config.ConfigKey
 import tsuki.core.PagedMangaParser
+import tsuki.exception.ParseException
 
 import tsuki.model.ContentType
 import tsuki.model.Manga
@@ -29,6 +30,7 @@ import tsuki.util.parseRaw
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
@@ -47,12 +49,13 @@ import java.util.Locale
 internal class VoraToon(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.VORATOON, 30) {
 
-    override val configKeyDomain = ConfigKey.Domain("voratoon.co")
+    override val configKeyDomain = ConfigKey.Domain("13.voratoon.com", "voratoon.co")
 
     private val siteDomain: String
-        get() = domain.takeUnless {
-            it == "voratoon.id" || it == "voratoon.com" || it.endsWith(".voratoon.com")
-        } ?: configKeyDomain.defaultValue
+        get() = when {
+            domain == "v8.voratoon.com" || domain == "voratoon.id" || domain == "voratoon.com" -> configKeyDomain.defaultValue
+            else -> domain
+        }
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
@@ -403,10 +406,13 @@ internal class VoraToon(context: MangaLoaderContext) :
         val (slug, storedChapter) = extractChapterUrlParts(chapter.url) ?: return emptyList()
         val chapterUrl = "https://$siteDomain/series/$slug/chapter/$storedChapter"
 
-        runCatching { fetchChapterPages(chapterUrl) }
-            .getOrNull()
-            ?.takeIf { it.isNotEmpty() }
-            ?.let { return it }
+        try {
+            val pages = fetchChapterPages(chapterUrl)
+            if (pages.isNotEmpty()) return pages
+        } catch (e: ParseException) {
+            throw e
+        } catch (_: Exception) {
+        }
 
         val legacyId = storedChapter.toLongOrNull()
         if (legacyId != null && legacyId > 100_000L) {
@@ -435,18 +441,25 @@ internal class VoraToon(context: MangaLoaderContext) :
                     }
                     if (legacyNumber != null) {
                         val legacyUrl = "https://$siteDomain/series/$slug/chapter/$legacyNumber"
-                        runCatching { fetchChapterPages(legacyUrl) }
-                            .getOrNull()
-                            ?.takeIf { it.isNotEmpty() }
-                            ?.let { return it }
+                        try {
+                            val pages = fetchChapterPages(legacyUrl)
+                            if (pages.isNotEmpty()) return pages
+                        } catch (e: ParseException) {
+                            throw e
+                        } catch (_: Exception) {
+                        }
                     }
                 }
             }
         }
-        runCatching { fetchPagesFromRsc(chapterUrl) }
-            .getOrNull()
-            ?.takeIf { it.isNotEmpty() }
-            ?.let { return it }
+
+        try {
+            val rscPages = fetchPagesFromRsc(chapterUrl)
+            if (rscPages.isNotEmpty()) return rscPages
+        } catch (e: ParseException) {
+            throw e
+        } catch (_: Exception) {
+        }
 
         return emptyList()
     }
@@ -468,7 +481,7 @@ internal class VoraToon(context: MangaLoaderContext) :
             val ticket = (chapterObj?.let { pageData.textOrNull(it, "pagesTicket") }
                 ?: pageData.text("pagesTicket"))
                 ?.ifBlank { null }
-                ?: ticketRegex.find(html)?.value
+                ?: ticketRegex.find(html)?.value?.trim('"', '\\', ' ')
 
             if (!ticket.isNullOrBlank()) {
                 unlockPages(chapterUrl, ticket, html)?.takeIf { it.isNotEmpty() }?.let {
@@ -476,7 +489,7 @@ internal class VoraToon(context: MangaLoaderContext) :
                 }
             }
         } else {
-            val fallbackTicket = ticketRegex.find(html)?.value
+            val fallbackTicket = ticketRegex.find(html)?.value?.trim('"', '\\', ' ')
             if (!fallbackTicket.isNullOrBlank()) {
                 unlockPages(chapterUrl, fallbackTicket, html)?.takeIf { it.isNotEmpty() }?.let {
                     return it
@@ -525,7 +538,7 @@ internal class VoraToon(context: MangaLoaderContext) :
         val ticket = (chapterObj?.let { pageData.textOrNull(it, "pagesTicket") }
             ?: pageData.text("pagesTicket"))
             ?.ifBlank { null }
-            ?: ticketRegex.find(body)?.value
+            ?: ticketRegex.find(body)?.value?.trim('"', '\\', ' ')
 
         if (!ticket.isNullOrBlank()) {
             unlockPages(chapterUrl, ticket, null)?.takeIf { it.isNotEmpty() }?.let {
@@ -586,11 +599,32 @@ internal class VoraToon(context: MangaLoaderContext) :
                 siteKey = TURNSTILE_SITE_KEY,
                 action = "reader",
             )
-        }.getOrNull() ?: return null
+        }.getOrNull()
+
+        if (turnstileToken.isNullOrBlank()) {
+            runCatching { context.requestBrowserAction(this, chapterUrl) }
+            throw ParseException(
+                "Verifikasi Cloudflare diperlukan untuk Voratoon. Buka di WebView lalu coba lagi.",
+                chapterUrl,
+            )
+        }
 
         // 3. Second attempt with Turnstile token
         val secondResponse = callUnlockAction(chapterUrl, actionId, ticket, turnstileToken)
-        return parseActionImages(secondResponse)
+        val secondPages = parseActionImages(secondResponse)
+        if (!secondPages.isNullOrEmpty()) {
+            return secondPages
+        }
+
+        if (secondResponse?.contains("\"ok\":false") == true || secondResponse?.contains("\"challenge\"") == true) {
+            runCatching { context.requestBrowserAction(this, chapterUrl) }
+            throw ParseException(
+                "Verifikasi Cloudflare tidak valid atau kedaluwarsa. Buka di WebView lalu coba lagi.",
+                chapterUrl,
+            )
+        }
+
+        return null
     }
 
     private suspend fun callUnlockAction(
@@ -606,6 +640,9 @@ internal class VoraToon(context: MangaLoaderContext) :
             }
         }.toString()
 
+        val httpUrl = chapterUrl.toHttpUrl()
+        val origin = "${httpUrl.scheme}://${httpUrl.host}"
+
         val request = Request.Builder()
             .url(chapterUrl)
             .post(payload.toRequestBody("text/plain;charset=UTF-8".toMediaType()))
@@ -614,7 +651,7 @@ internal class VoraToon(context: MangaLoaderContext) :
                     .set("Accept", "text/x-component")
                     .set("Next-Action", actionId)
                     .set("Referer", chapterUrl)
-                    .set("Origin", "https://$siteDomain")
+                    .set("Origin", origin)
                     .build(),
             )
             .build()
@@ -659,6 +696,19 @@ internal class VoraToon(context: MangaLoaderContext) :
                         .toList()
                     if (pages.isNotEmpty()) return pages
                 }
+            }
+        }
+
+        // Try parsing via NextJsData.extractRscPayloads
+        val payloads = runCatching { NextJsData.extractRscPayloads(responseBody) }.getOrNull()
+        if (!payloads.isNullOrEmpty()) {
+            val obj = NextJsData.findObjectInPayloads(payloads, "images")
+            val images = obj?.optJSONArray("images")
+            if (images != null && images.length() > 0) {
+                val pages = (0 until images.length()).mapNotNull { i ->
+                    images.optString(i).takeIf { it.isNotBlank() }?.let(::makePage)
+                }
+                if (pages.isNotEmpty()) return pages
             }
         }
 
@@ -775,10 +825,10 @@ internal class VoraToon(context: MangaLoaderContext) :
         private const val DEFAULT_UNLOCK_ACTION_ID = "605b45501da4fac116927b939594513ffb6f865309"
         private const val TURNSTILE_SITE_KEY = "0x4AAAAAAEOmIHqZQLQ6GPRc"
 
-        private val ticketRegex = Regex("""p1\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+""")
+        private val ticketRegex = Regex("""p1\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+""")
         private val pageScriptRegex = Regex("""/_next/static/chunks/app/series/[^"'\s]+/page-[^"'\s]+\.js(?:\?[^"'\s]*)?""")
         private val actionIdRegex = Regex("""createServerReference\)\("([0-9a-f]{20,})"[^)]*"unlockChapterPages"""")
 
-        private val chapterImageRegex = Regex("""https?://[^"'\s\\<>]*(?:voratoon)[^"'\s\\<>]*/[^"'\s\\<>?]+\.(?:jpg|jpeg|png|webp)""")
+        private val chapterImageRegex = Regex("""https?://[^"'\s\\<>]*(?:voratoon)[^"'\s\\<>]*/[^"'\s\\<>?]+\.(?:jpg|jpeg|png|webp|avif)""")
     }
 }
