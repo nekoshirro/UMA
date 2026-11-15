@@ -18,14 +18,21 @@ import tsuki.model.MangaTag
 import tsuki.model.RATING_UNKNOWN
 import tsuki.model.SortOrder
 
+import tsuki.util.FlightPage
 import tsuki.util.NextJsData
+import tsuki.util.await
 import tsuki.util.generateUid
+import tsuki.util.getTurnstileToken
 import tsuki.util.oneOrThrowIfMany
 import tsuki.util.parseRaw
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okhttp3.Headers
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
@@ -40,7 +47,12 @@ import java.util.Locale
 internal class VoraToon(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.VORATOON, 30) {
 
-    override val configKeyDomain = ConfigKey.Domain("voratoon.co", "13.voratoon.com", "voratoon.id")
+    override val configKeyDomain = ConfigKey.Domain("voratoon.co")
+
+    private val siteDomain: String
+        get() = domain.takeUnless {
+            it == "voratoon.id" || it == "voratoon.com" || it.endsWith(".voratoon.com")
+        } ?: configKeyDomain.defaultValue
 
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
@@ -51,12 +63,17 @@ internal class VoraToon(context: MangaLoaderContext) :
         val request = chain.request()
         val response = chain.proceed(request)
 
-        if (response.code == 403 && request.url.host.contains("voratoon")) {
+        val isAppHost = request.url.host.endsWith("voratoon.com") ||
+                request.url.host.endsWith("voratoon.co") ||
+                request.url.host.endsWith("voratoon.id")
+        val isStatic = request.url.encodedPath.startsWith("/_next/")
+
+        if (response.code == 403 && isAppHost && !isStatic) {
             response.close()
             runCatching {
                 chain.proceed(
                     request.newBuilder()
-                        .url("https://$domain/")
+                        .url("https://$siteDomain/")
                         .headers(request.headers.newBuilder().removeAll("Accept").build())
                         .build(),
                 ).close()
@@ -66,29 +83,42 @@ internal class VoraToon(context: MangaLoaderContext) :
         return response
     }
 
-    override fun getRequestHeaders() = super.getRequestHeaders().newBuilder()
-        .add("Referer", "https://$domain/")
-        .add("Origin", "https://$domain")
-        .add("Accept-language", "en-US,en;q=0.9,id;q=0.8")
+    override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
+        .set("Referer", "https://$siteDomain/")
+        .add("Origin", "https://$siteDomain")
+        .add("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7")
+        .add("sec-fetch-site", "same-origin")
+        .build()
+    
+    private fun rscRequestHeaders(): Headers = getRequestHeaders().newBuilder()
+        .set("Accept", "text/x-component")
+        .set("RSC", "1")
         .build()
 
     override val availableSortOrders: Set<SortOrder> = EnumSet.of(
         SortOrder.UPDATED,
         SortOrder.POPULARITY,
         SortOrder.RATING,
+        SortOrder.NEWEST,
         SortOrder.ALPHABETICAL,
     )
 
     override val filterCapabilities = MangaListFilterCapabilities(
+        isSearchSupported = true,
         isMultipleTagsSupported = true,
         isTagsExclusionSupported = false,
-        isSearchSupported = true,
+        isSearchWithFiltersSupported = true,
+        isYearSupported = false,
     )
 
+    @Volatile
+    private var tagsCache: Set<MangaTag>? = null
+    private val tagsMutex = Mutex()
+
     override suspend fun getFilterOptions(): MangaListFilterOptions {
-        val genreMap = fetchGenreMap()
+        val tags = fetchTags()
         return MangaListFilterOptions(
-            availableTags = genreMap.values.toSet(),
+            availableTags = tags,
             availableStates = EnumSet.of(
                 MangaState.ONGOING,
                 MangaState.FINISHED,
@@ -103,56 +133,82 @@ internal class VoraToon(context: MangaLoaderContext) :
         )
     }
 
-    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        val sortParam = when (order) {
-            SortOrder.POPULARITY -> "popular"
-            SortOrder.UPDATED -> "new"
-            SortOrder.ALPHABETICAL -> "az"
-            SortOrder.RATING -> "rating"
-            else -> "new"
+    private suspend fun fetchTags(): Set<MangaTag> {
+        return tagsMutex.withLock {
+            tagsCache ?: fetchTagsInternal().also { tagsCache = it }
         }
+    }
 
-        val url = buildString {
-            append("https://").append(domain).append("/browse")
-            val params = mutableListOf<String>()
+    private suspend fun fetchTagsInternal(): Set<MangaTag> {
+        val url = "https://$siteDomain/browse"
+        val html = runCatching {
+            webClient.httpGet(url, getRequestHeaders()).parseRaw()
+        }.getOrNull() ?: return emptySet()
 
-            if (page > 1) {
+        return try {
+            val pageData = NextJsData.findPage(html, "series", "seriesMeta")
+                ?: return emptySet()
+            val genresArray = pageData.data.optJSONArray("genres") ?: return emptySet()
+
+            val tags = mutableSetOf<MangaTag>()
+            for (i in 0 until genresArray.length()) {
+                genresArray.optJSONObject(i)?.toGenreTagOrNull()?.let(tags::add)
+            }
+            tags
+        } catch (_: Exception) {
+            emptySet()
+        }
+    }
+
+
+    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        val url = "https://$siteDomain/browse".let { base ->
+            buildString {
+                append(base)
+                val params = mutableListOf<String>()
                 params.add("page=$page")
-            }
+                params.add(
+                    "sort=${when (order) {
+                        SortOrder.POPULARITY -> "popular"
+                        SortOrder.RATING -> "rating"
+                        SortOrder.NEWEST -> "newseries"
+                        SortOrder.ALPHABETICAL -> "az"
+                        else -> "new"
+                    }}"
+                )
 
-            params.add("sort=$sortParam")
-
-            if (!filter.query.isNullOrBlank()) {
-                params.add("q=${URLEncoder.encode(filter.query, "UTF-8")}")
-            }
-
-            filter.states.oneOrThrowIfMany()?.let { state ->
-                val status = when (state) {
-                    MangaState.ONGOING -> "ongoing"
-                    MangaState.FINISHED -> "completed"
-                    MangaState.PAUSED -> "hiatus"
-                    MangaState.ABANDONED -> "cancelled"
-                    else -> null
+                filter.query?.takeIf { it.isNotBlank() }?.let {
+                    params.add("q=${URLEncoder.encode(it.trim(), "UTF-8")}")
                 }
-                status?.let { params.add("status=$it") }
-            }
 
-            filter.types.oneOrThrowIfMany()?.let { type ->
-                val format = when (type) {
-                    ContentType.MANGA -> "manga"
-                    ContentType.MANHWA -> "manhwa"
-                    ContentType.MANHUA -> "manhua"
-                    else -> null
+                if (filter.tags.isNotEmpty()) {
+                    val genreParam = filter.tags.joinToString(",") {
+                        it.title.lowercase(Locale.ROOT)
+                    }
+                    params.add("genre=${URLEncoder.encode(genreParam, "UTF-8")}")
                 }
-                format?.let { params.add("format=$it") }
-            }
 
-            if (filter.tags.isNotEmpty()) {
-                val genreParam = filter.tags.joinToString(",") { it.key }
-                params.add("genre=${URLEncoder.encode(genreParam, "UTF-8")}")
-            }
+                filter.states.oneOrThrowIfMany()?.let { state ->
+                    val status = when (state) {
+                        MangaState.ONGOING -> "ongoing"
+                        MangaState.FINISHED -> "completed"
+                        MangaState.PAUSED -> "hiatus"
+                        MangaState.ABANDONED -> "cancelled"
+                        else -> null
+                    }
+                    status?.let { params.add("status=$it") }
+                }
 
-            if (params.isNotEmpty()) {
+                filter.types.oneOrThrowIfMany()?.let { type ->
+                    val format = when (type) {
+                        ContentType.MANGA -> "manga"
+                        ContentType.MANHWA -> "manhwa"
+                        ContentType.MANHUA -> "manhua"
+                        else -> null
+                    }
+                    format?.let { params.add("format=$it") }
+                }
+
                 append("?").append(params.joinToString("&"))
             }
         }
@@ -161,21 +217,14 @@ internal class VoraToon(context: MangaLoaderContext) :
             webClient.httpGet(url, getRequestHeaders()).parseRaw()
         }.getOrNull() ?: return emptyList()
 
-        val seriesArray = NextJsData.findValue(html) { node ->
-            node is JSONObject && node.has("series") && node.optJSONArray("series") != null
-        }?.let { (it as JSONObject).optJSONArray("series") }
-            ?: NextJsData.findLargestArray(html) { first ->
-                first.has("data") && first.optJSONObject("data")?.has("slug") == true
-            }
+        val pageData = NextJsData.findPage(html, "series", "seriesMeta")
+            ?: return emptyList()
+        val seriesArray = pageData.data.optJSONArray("series") ?: return emptyList()
 
-        return if (seriesArray != null) {
-            parseSeriesList(seriesArray)
-        } else {
-            emptyList()
-        }
+        return parseSeriesList(seriesArray, pageData)
     }
 
-    private fun parseSeriesList(seriesArray: JSONArray): List<Manga> {
+    private fun parseSeriesList(seriesArray: JSONArray, pageData: FlightPage): List<Manga> {
         val result = mutableListOf<Manga>()
         for (i in 0 until seriesArray.length()) {
             val item = seriesArray.optJSONObject(i) ?: continue
@@ -191,26 +240,31 @@ internal class VoraToon(context: MangaLoaderContext) :
             }
 
             val cover = data.nonNullString("coverImage")?.let {
-                if (it.startsWith("http")) it else "https://$domain$it"
+                if (it.startsWith("http")) it else "https://$siteDomain$it"
             }
             val background = data.nonNullString("backgroundImage")?.let {
-                if (it.startsWith("http")) it else "https://$domain$it"
+                if (it.startsWith("http")) it else "https://$siteDomain$it"
             }
 
             result.add(
                 Manga(
                     id = generateUid(relativeUrl),
                     url = relativeUrl,
-                    publicUrl = "https://$domain$relativeUrl",
-                    title = data.optString("title").ifBlank { slug.replace('-', ' ') },
-                    altTitles = setOfNotNull(data.nonNullString("nativeTitle")),
+                    publicUrl = "https://$siteDomain$relativeUrl",
+                    title = pageData.textOrNull(data, "title")
+                        ?: data.optString("title").ifBlank { slug.replace('-', ' ') },
+                    altTitles = setOfNotNull(
+                        pageData.textOrNull(data, "nativeTitle") ?: data.nonNullString("nativeTitle"),
+                    ),
                     rating = data.toRating(),
                     contentRating = null,
                     coverUrl = cover,
                     largeCoverUrl = background ?: cover,
                     tags = genres,
                     state = data.toMangaState(),
-                    authors = setOfNotNull(data.nonNullString("author")),
+                    authors = setOfNotNull(
+                        pageData.textOrNull(data, "author") ?: data.nonNullString("author"),
+                    ),
                     source = source,
                 ),
             )
@@ -220,32 +274,39 @@ internal class VoraToon(context: MangaLoaderContext) :
 
     override suspend fun getDetails(manga: Manga): Manga {
         val slug = manga.url.removeSuffix("/").substringAfterLast("/")
-        val url = "https://$domain/series/$slug"
+        val url = "https://$siteDomain/series/$slug"
         val html = runCatching {
             webClient.httpGet(url, getRequestHeaders()).parseRaw()
         }.getOrNull() ?: return manga
 
         return try {
-            val initData = NextJsData.findValue(html) { node ->
-                node is JSONObject && node.has("series") && node.has("chapters")
-            } as? JSONObject
-
-            val seriesArray = initData?.optJSONArray("series")
-            val seriesData = seriesArray?.optJSONObject(0)?.optJSONObject("data")
-                ?: NextJsData.findObject(html, "slug", slug)
+            val pageData = NextJsData.findPage(html, "series", "chapters")
                 ?: return manga
 
-            val title = seriesData.optString("title").ifBlank { manga.title }
-            val nativeTitle = seriesData.nonNullString("nativeTitle")
-            val synopsis = seriesData.optString("synopsis", "")
-            val author = seriesData.nonNullString("author")
-            val coverImage = seriesData.nonNullString("coverImage")?.let {
-                if (it.startsWith("http")) it else "https://$domain$it"
-            } ?: manga.coverUrl
-            val backgroundImage = seriesData.nonNullString("backgroundImage")?.let {
-                if (it.startsWith("http")) it else "https://$domain$it"
-            }
-            val format = seriesData.nonNullString("format")?.lowercase(Locale.ROOT)
+            val seriesData = pageData.data.optJSONArray("series")
+                ?.optJSONObject(0)?.optJSONObject("data")
+                ?: return manga
+
+            val title = pageData.textOrNull(seriesData, "title")
+                ?: seriesData.nonNullString("title")
+                ?: manga.title
+            val nativeTitle = pageData.textOrNull(seriesData, "nativeTitle")
+                ?: seriesData.nonNullString("nativeTitle")
+            val synopsis = pageData.textOrNull(seriesData, "synopsis")
+                ?: seriesData.nonNullString("synopsis")
+                ?: ""
+            val author = pageData.textOrNull(seriesData, "author")
+                ?: seriesData.nonNullString("author")
+            val coverImage = pageData.textOrNull(seriesData, "coverImage")
+                ?: seriesData.nonNullString("coverImage")?.let {
+                    if (it.startsWith("http")) it else "https://$siteDomain$it"
+                }
+            val backgroundImage = pageData.textOrNull(seriesData, "backgroundImage")
+                ?: seriesData.nonNullString("backgroundImage")?.let {
+                    if (it.startsWith("http")) it else "https://$siteDomain$it"
+                }
+            val format = (pageData.textOrNull(seriesData, "format")
+                ?: seriesData.nonNullString("format"))?.lowercase(Locale.ROOT)
 
             val genres = mutableSetOf<MangaTag>()
             seriesData.optJSONArray("genres")?.let { arr ->
@@ -254,7 +315,8 @@ internal class VoraToon(context: MangaLoaderContext) :
                 }
             }
 
-            val releaseYear = seriesData.nonNullString("releaseDate")
+            val releaseYear = pageData.textOrNull(seriesData, "releaseDate")
+                ?: seriesData.nonNullString("releaseDate")
             val extraTags = buildSet {
                 releaseYear?.let { add(MangaTag(it, it, source)) }
                 format?.let {
@@ -262,14 +324,9 @@ internal class VoraToon(context: MangaLoaderContext) :
                 }
             }
 
-            val chaptersArray = initData?.optJSONArray("chapters")
-                ?: NextJsData.findLargestArray(html) { first ->
-                    first.has("data") && first.optJSONObject("data")?.has("index") == true
-                }
-
-            val chapters = chaptersArray?.let { parseChapters(it, slug) }
+            val chaptersArray = pageData.data.optJSONArray("chapters")
+            val chapters = chaptersArray?.let { parseChapters(it, slug, pageData) }
                 ?.ifEmpty { null }
-                ?: parseChaptersFromHtml(html, slug)
                 ?: manga.chapters
 
             manga.copy(
@@ -279,8 +336,8 @@ internal class VoraToon(context: MangaLoaderContext) :
                 state = seriesData.toMangaState() ?: manga.state,
                 authors = setOfNotNull(author).ifEmpty { manga.authors },
                 tags = genres + extraTags,
-                coverUrl = coverImage,
-                largeCoverUrl = backgroundImage ?: coverImage,
+                coverUrl = coverImage ?: manga.coverUrl,
+                largeCoverUrl = backgroundImage ?: coverImage ?: manga.largeCoverUrl,
                 rating = seriesData.toRating(),
                 chapters = chapters,
             )
@@ -289,29 +346,37 @@ internal class VoraToon(context: MangaLoaderContext) :
         }
     }
 
-    private fun parseChapters(chaptersArray: JSONArray, slug: String): List<MangaChapter> {
+    private fun parseChapters(
+        chaptersArray: JSONArray,
+        slug: String,
+        pageData: FlightPage,
+    ): List<MangaChapter> {
         val chapters = mutableListOf<MangaChapter>()
         for (i in 0 until chaptersArray.length()) {
             val ch = chaptersArray.optJSONObject(i) ?: continue
             val chapterData = ch.optJSONObject("data")
 
-            val chapterIndex = if (ch.has("chapterIndex")) {
-                ch.optDouble("chapterIndex", 0.0)
-            } else {
-                chapterData?.optDouble("index", 0.0) ?: 0.0
+            val chapterIndex = ch.optDouble("chapterIndex", Double.NaN).let { top ->
+                if (top.isNaN()) chapterData?.optDouble("index", 0.0) ?: 0.0 else top
             }
 
-            val formattedIndex = chapterIndex.toString().removeSuffix(".0")
+            val formattedIndex = if (chapterIndex % 1.0 == 0.0) {
+                chapterIndex.toInt().toString()
+            } else {
+                chapterIndex.toString()
+            }
             val chapterUrl = "/series/$slug/chapter/$formattedIndex"
 
-            val title = chapterData?.nonNullString("title")
-            val titleText = if (!title.isNullOrBlank()) {
-                "Chapter $formattedIndex: $title"
+            val rawTitle = chapterData?.let { pageData.textOrNull(it, "title") }
+                ?: chapterData?.nonNullString("title")
+            val titleText = if (!rawTitle.isNullOrBlank()) {
+                "Chapter $formattedIndex: $rawTitle"
             } else {
                 "Chapter $formattedIndex"
             }
-
-            val uploadDate = parseChapterDate(ch.optString("createdAt", ""))
+            val uploadDate = parseChapterDate(
+                ch.optString("createdAt", ch.optString("updatedAt", "")),
+            )
 
             chapters.add(
                 MangaChapter(
@@ -327,152 +392,343 @@ internal class VoraToon(context: MangaLoaderContext) :
                 ),
             )
         }
-        return chapters.sortedBy { it.number }
-    }
-
-    private fun parseChaptersFromHtml(html: String, slug: String): List<MangaChapter>? {
-        return runCatching {
-            val doc = Jsoup.parse(html)
-            val elements = doc.select("a[href*=/series/$slug/chapter/]")
-            val chapters = mutableListOf<MangaChapter>()
-            for (el in elements) {
-                val href = el.attr("href").substringBefore('?').substringBefore('#')
-                val chNumStr = href.removeSuffix("/").substringAfterLast("/")
-                val chNum = chNumStr.toFloatOrNull() ?: continue
-                val titleText = el.text().trim().ifBlank { "Chapter $chNumStr" }
-                chapters.add(
-                    MangaChapter(
-                        id = generateUid(href),
-                        title = titleText,
-                        url = href,
-                        number = chNum,
-                        volume = 0,
-                        scanlator = null,
-                        uploadDate = 0L,
-                        branch = null,
-                        source = source,
-                    ),
-                )
-            }
-            chapters.distinctBy { it.number }.sortedBy { it.number }.ifEmpty { null }
-        }.getOrNull()
+        return chapters.sortedWith(
+            compareBy<MangaChapter> { it.number }
+                .thenBy { it.uploadDate }
+                .thenBy { it.id },
+        )
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val fullUrl = if (chapter.url.startsWith("http")) chapter.url else "https://$domain${chapter.url}"
-        val html = runCatching {
-            webClient.httpGet(fullUrl, getRequestHeaders()).parseRaw()
-        }.getOrNull() ?: return emptyList()
+        val (slug, storedChapter) = extractChapterUrlParts(chapter.url) ?: return emptyList()
+        val chapterUrl = "https://$siteDomain/series/$slug/chapter/$storedChapter"
 
-        // 1. Try NextJsData
-        val chapterObj = NextJsData.findValue(html) { node ->
-            node is JSONObject && node.has("chapter") && node.optJSONObject("chapter")?.has("data") == true
-        }?.let { (it as JSONObject).optJSONObject("chapter") }
+        runCatching { fetchChapterPages(chapterUrl) }
+            .getOrNull()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { return it }
 
-        val imagesArray = chapterObj?.optJSONObject("data")?.optJSONArray("images")
-        if (imagesArray != null && imagesArray.length() > 0) {
-            val pages = (0 until imagesArray.length()).mapNotNull { i ->
-                val imgUrl = imagesArray.optString(i)
-                if (imgUrl.isNullOrBlank()) {
-                    null
-                } else {
-                    MangaPage(
-                        id = generateUid(imgUrl),
-                        url = imgUrl,
-                        preview = null,
-                        source = source,
-                    )
+        val legacyId = storedChapter.toLongOrNull()
+        if (legacyId != null && legacyId > 100_000L) {
+            val seriesUrl = "https://$siteDomain/series/$slug"
+            val seriesHtml = runCatching {
+                webClient.httpGet(seriesUrl, getRequestHeaders()).parseRaw()
+            }.getOrNull()
+            if (seriesHtml != null) {
+                val seriesPage = NextJsData.findPage(seriesHtml, "series", "chapters")
+                val chaptersArray = seriesPage?.data?.optJSONArray("chapters")
+                if (chaptersArray != null) {
+                    var legacyNumber: String? = null
+                    for (i in 0 until chaptersArray.length()) {
+                        val ch = chaptersArray.optJSONObject(i) ?: continue
+                        if (ch.optLong("id") == legacyId) {
+                            val num = ch.optDouble("chapterIndex", Double.NaN).let { top ->
+                                if (top.isNaN()) {
+                                    ch.optJSONObject("data")?.optDouble("index", 0.0) ?: 0.0
+                                } else top
+                            }
+                            legacyNumber = if (num % 1.0 == 0.0) {
+                                num.toInt().toString()
+                            } else num.toString()
+                            break
+                        }
+                    }
+                    if (legacyNumber != null) {
+                        val legacyUrl = "https://$siteDomain/series/$slug/chapter/$legacyNumber"
+                        runCatching { fetchChapterPages(legacyUrl) }
+                            .getOrNull()
+                            ?.takeIf { it.isNotEmpty() }
+                            ?.let { return it }
+                    }
                 }
             }
-            if (pages.isNotEmpty()) return pages
+        }
+        runCatching { fetchPagesFromRsc(chapterUrl) }
+            .getOrNull()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { return it }
+
+        return emptyList()
+    }
+
+    @Volatile
+    private var actionIdCache: String? = null
+
+    private suspend fun fetchChapterPages(chapterUrl: String): List<MangaPage> {
+        val html = webClient.httpGet(chapterUrl, getRequestHeaders()).parseRaw()
+
+        val pageData = NextJsData.findPage(html, "chapter", "chapters")
+            ?: NextJsData.findPage(html, "chapter")
+        if (pageData != null) {
+            val chapterObj = pageData.data.optJSONObject("chapter")
+            extractPagesFromChapterObj(chapterObj)?.takeIf { it.isNotEmpty() }?.let {
+                return it
+            }
+
+            val ticket = (chapterObj?.let { pageData.textOrNull(it, "pagesTicket") }
+                ?: pageData.text("pagesTicket"))
+                ?.ifBlank { null }
+                ?: ticketRegex.find(html)?.value
+
+            if (!ticket.isNullOrBlank()) {
+                unlockPages(chapterUrl, ticket, html)?.takeIf { it.isNotEmpty() }?.let {
+                    return it
+                }
+            }
+        } else {
+            val fallbackTicket = ticketRegex.find(html)?.value
+            if (!fallbackTicket.isNullOrBlank()) {
+                unlockPages(chapterUrl, fallbackTicket, html)?.takeIf { it.isNotEmpty() }?.let {
+                    return it
+                }
+            }
         }
 
-        // 2. Fallback: Parse data-chapter-page DOM attributes
         val doc = Jsoup.parse(html)
-        val imgElements = doc.select("img[data-chapter-page]")
+        val imgElements = doc.select("img[data-chapter-page], [data-reader-chapter-id] img")
         if (imgElements.isNotEmpty()) {
             val pages = imgElements.mapNotNull { el ->
-                val imgUrl = el.attr("data-chapter-page").ifBlank { el.attr("src") }.trim()
-                if (imgUrl.isBlank() || !imgUrl.startsWith("http")) {
-                    null
-                } else {
-                    MangaPage(
-                        id = generateUid(imgUrl),
-                        url = imgUrl,
-                        preview = null,
-                        source = source,
-                    )
-                }
+                val imgUrl = el.attr("data-chapter-page").ifBlank {
+                    el.attr("data-src").ifBlank { el.attr("src") }
+                }.trim()
+                if (imgUrl.isBlank() || !imgUrl.startsWith("http")) null else makePage(imgUrl)
             }
             if (pages.isNotEmpty()) return pages
         }
 
-        // 3. Fallback: Regex extraction of cdn.voratoon.com image URLs
-        val matches = cdnImageRegex.findAll(html)
+        return chapterImageRegex.findAll(html)
             .map { it.value }
             .distinct()
+            .filter { url ->
+                val lower = url.lowercase(Locale.ROOT)
+                "/logo/" !in lower && "/ads/" !in lower && "/icon" !in lower && "cover" !in lower && "background" !in lower
+            }
+            .map(::makePage)
             .toList()
-        if (matches.isNotEmpty()) {
-            return matches.map { url ->
-                MangaPage(
-                    id = generateUid(url),
-                    url = url,
-                    preview = null,
-                    source = source,
-                )
+    }
+
+    private suspend fun fetchPagesFromRsc(chapterUrl: String): List<MangaPage> {
+        val body = runCatching {
+            webClient.httpGet(chapterUrl, rscRequestHeaders()).body?.string().orEmpty()
+        }.getOrNull() ?: return emptyList()
+        if (body.isEmpty() || body.trimStart().startsWith("<")) return emptyList()
+
+        val pageData = runCatching {
+            NextJsData.findPageRsc(body, "chapter")
+        }.getOrNull() ?: return emptyList()
+
+        val chapterObj = pageData.data.optJSONObject("chapter")
+        extractPagesFromChapterObj(chapterObj)?.takeIf { it.isNotEmpty() }?.let {
+            return it
+        }
+
+        val ticket = (chapterObj?.let { pageData.textOrNull(it, "pagesTicket") }
+            ?: pageData.text("pagesTicket"))
+            ?.ifBlank { null }
+            ?: ticketRegex.find(body)?.value
+
+        if (!ticket.isNullOrBlank()) {
+            unlockPages(chapterUrl, ticket, null)?.takeIf { it.isNotEmpty() }?.let {
+                return it
             }
         }
 
         return emptyList()
     }
 
-    @Volatile
-    private var genreCache: Map<String, MangaTag>? = null
-    private val genreMutex = Mutex()
-
-    private suspend fun fetchGenreMap(): Map<String, MangaTag> {
-        return genreMutex.withLock {
-            genreCache ?: fetchGenreMapInternal().also { genreCache = it }
-        }
-    }
-
-    private suspend fun fetchGenreMapInternal(): Map<String, MangaTag> {
-        val url = "https://$domain/browse"
-        val html = runCatching {
-            webClient.httpGet(url, getRequestHeaders()).parseRaw()
-        }.getOrNull()
-
-        val map = mutableMapOf<String, MangaTag>()
+    private suspend fun resolveUnlockActionId(html: String?): String {
+        actionIdCache?.let { return it }
 
         if (!html.isNullOrBlank()) {
-            try {
-                val initData = NextJsData.findValue(html) { node ->
-                    node is JSONObject && node.has("genres") && node.optJSONArray("genres") != null
-                } as? JSONObject
-
-                val genresArray = initData?.optJSONArray("genres")
-                    ?: NextJsData.findLargestArray(html) { first ->
-                        first.has("data") && first.optJSONObject("data")?.has("name") == true
-                    }
-
-                if (genresArray != null) {
-                    for (i in 0 until genresArray.length()) {
-                        genresArray.optJSONObject(i)?.toGenreTagOrNull()?.let {
-                            map[it.title] = it
-                        }
+            val scriptPath = pageScriptRegex.find(html)?.value
+            if (scriptPath != null) {
+                val scriptUrl = if (scriptPath.startsWith("http")) scriptPath else "https://$siteDomain$scriptPath"
+                val scriptContent = runCatching {
+                    webClient.httpGet(scriptUrl, getRequestHeaders()).parseRaw()
+                }.getOrNull()
+                if (scriptContent != null) {
+                    val id = actionIdRegex.find(scriptContent)?.groupValues?.get(1)
+                    if (id != null) {
+                        actionIdCache = id
+                        return id
                     }
                 }
-            } catch (_: Exception) {
+            }
+        }
+        return DEFAULT_UNLOCK_ACTION_ID
+    }
+
+    private suspend fun unlockPages(
+        chapterUrl: String,
+        ticket: String,
+        html: String?,
+    ): List<MangaPage>? {
+        val actionId = resolveUnlockActionId(html)
+
+        // 1. First attempt: call unlockChapterPages without Turnstile token
+        val firstResponse = callUnlockAction(chapterUrl, actionId, ticket, null)
+        val firstPages = parseActionImages(firstResponse)
+        if (!firstPages.isNullOrEmpty()) {
+            return firstPages
+        }
+
+        val isChallenge = firstResponse?.contains("\"challenge\"") == true ||
+                firstResponse?.contains("\"ok\":false") == true
+        if (!isChallenge) {
+            return null
+        }
+
+        // 2. Solve Cloudflare Turnstile headlessly
+        val turnstileToken = runCatching {
+            getTurnstileToken(
+                context = context,
+                url = chapterUrl,
+                siteKey = TURNSTILE_SITE_KEY,
+                action = "reader",
+            )
+        }.getOrNull() ?: return null
+
+        // 3. Second attempt with Turnstile token
+        val secondResponse = callUnlockAction(chapterUrl, actionId, ticket, turnstileToken)
+        return parseActionImages(secondResponse)
+    }
+
+    private suspend fun callUnlockAction(
+        chapterUrl: String,
+        actionId: String,
+        ticket: String,
+        turnstileToken: String?,
+    ): String? {
+        val payload = JSONArray().apply {
+            put(ticket)
+            if (turnstileToken != null) {
+                put(turnstileToken)
+            }
+        }.toString()
+
+        val request = Request.Builder()
+            .url(chapterUrl)
+            .post(payload.toRequestBody("text/plain;charset=UTF-8".toMediaType()))
+            .headers(
+                getRequestHeaders().newBuilder()
+                    .set("Accept", "text/x-component")
+                    .set("Next-Action", actionId)
+                    .set("Referer", chapterUrl)
+                    .set("Origin", "https://$siteDomain")
+                    .build(),
+            )
+            .build()
+
+        return runCatching {
+            context.httpClient.newCall(request).await().use { resp ->
+                resp.body?.string().orEmpty()
+            }
+        }.getOrNull()
+    }
+
+    private fun parseActionImages(responseBody: String?): List<MangaPage>? {
+        if (responseBody.isNullOrBlank()) return null
+
+        // Try parsing JSON objects from flight rows
+        for (line in responseBody.lineSequence()) {
+            val trimmed = line.trim()
+            val colon = trimmed.indexOf(':')
+            if (colon in 0..5) {
+                val jsonStr = trimmed.substring(colon + 1)
+                val json = runCatching { JSONObject(jsonStr) }.getOrNull() ?: continue
+
+                val images = json.optJSONArray("images")
+                    ?: json.optJSONObject("data")?.optJSONArray("images")
+                    ?: json.optJSONObject("chapter")?.optJSONObject("data")?.optJSONArray("images")
+
+                if (images != null && images.length() > 0) {
+                    val pages = (0 until images.length()).mapNotNull { i ->
+                        images.optString(i).takeIf { it.isNotBlank() }?.let(::makePage)
+                    }
+                    if (pages.isNotEmpty()) return pages
+                }
+
+                val dataImages = json.optJSONObject("dataImages")
+                    ?: json.optJSONObject("data")?.optJSONObject("dataImages")
+                if (dataImages != null) {
+                    val pages = dataImages.keys().asSequence()
+                        .sortedBy { it.toIntOrNull() ?: Int.MAX_VALUE }
+                        .mapNotNull { key ->
+                            dataImages.optString(key).takeIf { it.isNotBlank() }?.let(::makePage)
+                        }
+                        .toList()
+                    if (pages.isNotEmpty()) return pages
+                }
             }
         }
 
-        if (map.isEmpty()) {
-            for ((id, name) in STATIC_GENRES) {
-                map[name] = MangaTag(title = name, key = id.toString(), source = source)
+        // Fallback: check any array in flight body for image URLs
+        for (line in responseBody.lineSequence()) {
+            val colon = line.indexOf(':')
+            if (colon in 0..5) {
+                val content = line.substring(colon + 1).trim()
+                if (content.startsWith("[") && content.endsWith("]")) {
+                    val arr = runCatching { JSONArray(content) }.getOrNull() ?: continue
+                    if (arr.length() > 0 && (0 until arr.length()).any { arr.optString(it).startsWith("http") }) {
+                        val pages = (0 until arr.length()).mapNotNull { i ->
+                            arr.optString(i).takeIf { it.startsWith("http") }?.let(::makePage)
+                        }
+                        if (pages.isNotEmpty()) return pages
+                    }
+                }
             }
         }
-        return map
+
+        return null
     }
+
+    private fun extractPagesFromChapterObj(chapterObj: JSONObject?): List<MangaPage>? {
+        if (chapterObj == null) return null
+
+        chapterObj.optJSONObject("data")?.optJSONArray("images")?.let { images ->
+            if (images.length() > 0) {
+                return (0 until images.length()).mapNotNull { i ->
+                    images.optString(i).takeIf { it.isNotBlank() }?.let(::makePage)
+                }
+            }
+        }
+
+        chapterObj.optJSONObject("dataImages")?.let { dataImages ->
+            val pages = dataImages.keys().asSequence()
+                .sortedBy { it.toIntOrNull() ?: Int.MAX_VALUE }
+                .mapNotNull { key ->
+                    dataImages.optString(key).takeIf { it.isNotBlank() }?.let(::makePage)
+                }
+                .toList()
+            if (pages.isNotEmpty()) return pages
+        }
+
+        return null
+    }
+
+    private fun makePage(url: String) = MangaPage(
+        id = generateUid(url),
+        url = url,
+        preview = null,
+        source = source,
+    )
+
+    private fun extractChapterUrlParts(url: String): Pair<String, String>? {
+        val normalized = when {
+            url.startsWith("http") ->
+                url.substringAfter("://").substringAfter('/', missingDelimiterValue = "")
+            else -> url.removePrefix("/")
+        }.substringBefore('?').substringBefore('#')
+
+        val parts = normalized.split("/").filter { it.isNotBlank() }
+        if (parts.size < 4) return null
+        if (parts[0] != "series") return null
+        if (parts[2] != "chapter" && parts[2] != "chapters") return null
+        return parts[1] to parts[3]
+    }
+
+    private fun FlightPage.textOrNull(obj: JSONObject, key: String): String? =
+        text(obj, key)?.takeUnless { it.equals("null", ignoreCase = true) || it.isBlank() }
 
     private fun parseChapterDate(dateStr: String): Long {
         if (dateStr.isBlank()) return 0L
@@ -485,9 +741,8 @@ internal class VoraToon(context: MangaLoaderContext) :
         }
     }
 
-    private fun JSONObject.nonNullString(key: String): String? {
-        return optString(key).takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
-    }
+    private fun JSONObject.nonNullString(key: String): String? =
+        optString(key).takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
 
     private fun JSONObject.toMangaState(): MangaState? {
         val status = nonNullString("status")?.lowercase(Locale.ROOT) ?: return null
@@ -506,66 +761,24 @@ internal class VoraToon(context: MangaLoaderContext) :
     }
 
     private fun JSONObject.toGenreTagOrNull(): MangaTag? {
-        val name = optJSONObject("data")?.optString("name").orEmpty().ifBlank { optString("name") }.trim()
+        val name = optJSONObject("data")?.optString("name").orEmpty()
+            .ifBlank { optString("name") }
+            .trim()
         val id = optInt("id", -1)
-        if (name.isEmpty()) return null
-        val tagKey = if (id != -1) id.toString() else name
-        return MangaTag(title = name, key = tagKey, source = source)
+        if (name.isEmpty() || id == -1) return null
+        return MangaTag(title = name, key = id.toString(), source = source)
     }
 
     companion object {
         private val isoDateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ROOT)
-        private val cdnImageRegex = Regex("""https?://cdn\.voratoon\.com/[^"'\s\\<>]+\.(?:jpg|jpeg|png|webp)""")
 
-        private val STATIC_GENRES = mapOf(
-            49 to "Adult",
-            11 to "4-Koma",
-            19 to "Action",
-            16 to "Adventure",
-            22 to "Comedy",
-            7 to "Cooking",
-            40 to "Demons",
-            29 to "Drama",
-            47 to "Ecchi",
-            28 to "Fantasy",
-            17 to "Game",
-            41 to "Gender Bender",
-            15 to "Gore",
-            34 to "Harem",
-            10 to "Historical",
-            18 to "Horror",
-            6 to "Isekai",
-            23 to "Josei",
-            35 to "Magic",
-            46 to "Martial Arts",
-            37 to "Mature",
-            20 to "Mecha",
-            9 to "Medical",
-            36 to "Military",
-            44 to "Music",
-            39 to "Mystery",
-            33 to "One-Shot",
-            43 to "Police",
-            4 to "Psychological",
-            14 to "Reincarnation",
-            26 to "Romance",
-            42 to "School",
-            2 to "School Life",
-            32 to "Sci-Fi",
-            1 to "Seinen",
-            31 to "Shoujo",
-            27 to "Shoujo Ai",
-            30 to "Shounen",
-            25 to "Shounen Ai",
-            13 to "Slice of Life",
-            12 to "Sports",
-            45 to "Super Power",
-            24 to "Supernatural",
-            5 to "Thriller",
-            38 to "Tragedy",
-            21 to "Vampire",
-            8 to "Webtoons",
-            3 to "Yuri",
-        )
+        private const val DEFAULT_UNLOCK_ACTION_ID = "605b45501da4fac116927b939594513ffb6f865309"
+        private const val TURNSTILE_SITE_KEY = "0x4AAAAAAEOmIHqZQLQ6GPRc"
+
+        private val ticketRegex = Regex("""p1\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+""")
+        private val pageScriptRegex = Regex("""/_next/static/chunks/app/series/[^"'\s]+/page-[^"'\s]+\.js(?:\?[^"'\s]*)?""")
+        private val actionIdRegex = Regex("""createServerReference\)\("([0-9a-f]{20,})"[^)]*"unlockChapterPages"""")
+
+        private val chapterImageRegex = Regex("""https?://[^"'\s\\<>]*(?:voratoon)[^"'\s\\<>]*/[^"'\s\\<>?]+\.(?:jpg|jpeg|png|webp)""")
     }
 }
