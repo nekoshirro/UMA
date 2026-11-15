@@ -57,7 +57,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 internal object DoujinDesuDns : Dns {
-    private val blockedPrefixes = listOf("36.86.", "118.98.", "180.250.", "103.229.")
+    private val blockedPrefixes = listOf(
+        "36.86.", "118.98.", "180.250.", "103.229.", "114.124.", "202.152.", "202.73.", "10.", "127.",
+    )
 
     internal val cloudflareDesuIps = listOf(
         InetAddress.getByName("104.26.1.249"),
@@ -81,28 +83,26 @@ internal object DoujinDesuDns : Dns {
 
         dnsCache[hostname]?.let { return it }
 
-        val systemAddresses = runCatching { Dns.SYSTEM.lookup(hostname) }.getOrNull().orEmpty()
-        val nonBlocked = systemAddresses.filterNot { addr ->
-            val hostAddress = addr.hostAddress ?: ""
-            blockedPrefixes.any { hostAddress.startsWith(it) }
-        }
-
-        if (nonBlocked.isNotEmpty()) {
-            val fallback = if (hostname.endsWith("desu.pics")) cloudflarePicsIps else cloudflareDesuIps
-            val combined = (nonBlocked + fallback).distinct()
-            dnsCache[hostname] = combined
-            return combined
+        val fallback = if (hostname.endsWith("desu.pics") || hostname == "desu.pics") {
+            cloudflarePicsIps
+        } else {
+            cloudflareDesuIps
         }
 
         val dohAddresses = resolveDoH(hostname)
-        if (!dohAddresses.isNullOrEmpty()) {
-            dnsCache[hostname] = dohAddresses
-            return dohAddresses
+        val validDoh = dohAddresses?.filterNot { addr ->
+            val hostAddress = addr.hostAddress ?: ""
+            blockedPrefixes.any { hostAddress.startsWith(it) }
+        }.orEmpty()
+
+        val result = if (validDoh.isNotEmpty()) {
+            (validDoh + fallback).distinct()
+        } else {
+            fallback
         }
 
-        val staticFallback = if (hostname.endsWith("desu.pics")) cloudflarePicsIps else cloudflareDesuIps
-        dnsCache[hostname] = staticFallback
-        return staticFallback
+        dnsCache[hostname] = result
+        return result
     }
 
     internal fun resolveDoH(hostname: String): List<InetAddress>? {
@@ -161,6 +161,14 @@ internal abstract class DoujinDesuParser(
     private val client: OkHttpClient by lazy {
         context.httpClient.newBuilder()
             .dns(DoujinDesuDns)
+            .addNetworkInterceptor { chain ->
+                val req = chain.request()
+                if (req.header(INTERNAL_HEADER) != null) {
+                    chain.proceed(req.newBuilder().removeHeader(INTERNAL_HEADER).build())
+                } else {
+                    chain.proceed(req)
+                }
+            }
             .build()
     }
 
@@ -399,13 +407,48 @@ internal abstract class DoujinDesuParser(
             val obj = array.getJSONObject(i)
             val slug = obj.getString("slug")
             val href = "/manga/$slug"
+            val state = when (obj.optString("status").lowercase()) {
+                "completed", "finished" -> MangaState.FINISHED
+                "ongoing", "publishing" -> MangaState.ONGOING
+                else -> null
+            }
+            val tags = mutableSetOf<MangaTag>()
+            val genresArray = obj.optJSONArray("manga_genres")
+            if (genresArray != null) {
+                for (j in 0 until genresArray.length()) {
+                    val genreObj = genresArray.getJSONObject(j).optJSONObject("genres") ?: continue
+                    tags.add(
+                        MangaTag(
+                            key = genreObj.getString("slug"),
+                            title = genreObj.getString("name"),
+                            source = source,
+                        )
+                    )
+                }
+            }
+            if (tags.isEmpty()) {
+                val termsStr = obj.optString("terms")
+                if (termsStr.isNotEmpty()) {
+                    termsStr.split(',').forEach { term ->
+                        val parts = term.split(':')
+                        if (parts.size >= 2 && parts[1] == "genre") {
+                            val name = parts[0].trim()
+                            val tagSlug = name.lowercase().replace(" ", "-")
+                            tags.add(MangaTag(key = tagSlug, title = name, source = source))
+                        }
+                    }
+                }
+            }
+            val rawRating = obj.optDouble("rating", 0.0)
+            val rating = if (rawRating > 0.0) (rawRating / 10.0).toFloat() else RATING_UNKNOWN
+
             Manga(
                 id = generateUid(href),
                 title = obj.getString("title"),
                 altTitles = emptySet(),
                 url = href,
                 publicUrl = href.toAbsoluteUrl(domain),
-                rating = obj.optDouble("rating", 0.0).toFloat() / 10f,
+                rating = rating,
                 contentRating = ContentRating.ADULT,
                 coverUrl = obj.optString("cover_url").takeIf { it.isNotEmpty() && it != "null" }?.let { cover ->
                     when {
@@ -414,8 +457,8 @@ internal abstract class DoujinDesuParser(
                         else -> cover.toAbsoluteUrl(domain)
                     }
                 },
-                tags = emptySet(),
-                state = null,
+                tags = tags,
+                state = state,
                 authors = emptySet(),
                 largeCoverUrl = null,
                 description = null,
@@ -429,11 +472,12 @@ internal abstract class DoujinDesuParser(
             detailsCache[manga.url]?.let { return it }
         }
 
-        val slug = if ("/manga/" in manga.url) {
-            manga.url.substringAfter("/manga/").trim('/')
+        val rawSlug = if ("/manga/" in manga.url) {
+            manga.url.substringAfter("/manga/")
         } else {
-            manga.url.trim('/')
+            manga.url
         }
+        val slug = rawSlug.substringBefore('?').substringBefore('#').trim('/')
         val url = "/api/manga/$slug".toAbsoluteUrl(domain)
 
         val jsonResponse = executeWithCloudflareRetry(url, getRequestHeaders()).parseJson()
@@ -556,15 +600,18 @@ internal abstract class DoujinDesuParser(
             }
         }
 
+        val rawRating = obj.optDouble("rating", 0.0)
+        val rating = if (rawRating > 0.0) (rawRating / 10.0).toFloat() else manga.rating
+
         val result = manga.copy(
             authors = authorsList,
             altTitles = altTitles,
             description = cleanDesc,
             state = state,
-            rating = obj.optDouble("rating", 0.0).toFloat() / 10f,
+            rating = rating,
             tags = tags,
             coverUrl = coverUrl ?: manga.coverUrl,
-            chapters = chapters.sortedBy { it.number },
+            chapters = chapters.sortedWith(compareBy<MangaChapter> { it.number }.thenBy { it.uploadDate }),
         )
 
         synchronized(detailsCacheLock) {
@@ -574,11 +621,12 @@ internal abstract class DoujinDesuParser(
     }
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val chId = if ("/reader/" in chapter.url) {
-            chapter.url.substringAfter("/reader/").trim('/')
+        val rawChId = if ("/reader/" in chapter.url) {
+            chapter.url.substringAfter("/reader/")
         } else {
-            chapter.url.trim('/')
+            chapter.url
         }
+        val chId = rawChId.substringBefore('?').substringBefore('#').trim('/')
         val url = "/api/chapters/$chId".toAbsoluteUrl(domain)
 
         val jsonResponse = executeWithCloudflareRetry(url, getRequestHeaders()).parseJson()
@@ -615,7 +663,7 @@ internal abstract class DoujinDesuParser(
                 else -> unescaped.toAbsoluteUrl(domain)
             }
             MangaPage(
-                id = generateUid(fullUrl),
+                id = generateUid(fullUrl.substringBefore('?')),
                 url = fullUrl,
                 preview = null,
                 source = source,
@@ -628,9 +676,9 @@ internal abstract class DoujinDesuParser(
         if (segments.isEmpty()) return null
 
         val slug = when (segments.firstOrNull()) {
-            "manga" -> segments.getOrNull(1)
+            "manga" -> segments.getOrNull(1)?.substringBefore('?')
             "reader" -> {
-                val chapterId = segments.getOrNull(1) ?: return null
+                val chapterId = segments.getOrNull(1)?.substringBefore('?') ?: return null
                 val chUrl = "/api/chapters/$chapterId".toAbsoluteUrl(domain)
                 runCatching {
                     val resp = executeWithCloudflareRetry(chUrl, getRequestHeaders()).parseJson()
@@ -639,7 +687,7 @@ internal abstract class DoujinDesuParser(
                 }.getOrNull()
             }
             else -> null
-        } ?: return null
+        }?.substringBefore('#')?.trim('/') ?: return null
 
         val href = "/manga/$slug"
         return getDetails(
