@@ -27,6 +27,7 @@ import tsuki.util.getTurnstileToken
 import tsuki.util.oneOrThrowIfMany
 import tsuki.util.parseRaw
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
@@ -88,9 +89,9 @@ internal class VoraToon(context: MangaLoaderContext) :
 
     override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
         .set("Referer", "https://$siteDomain/")
-        .add("Origin", "https://$siteDomain")
-        .add("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7")
-        .add("sec-fetch-site", "same-origin")
+        .set("Origin", "https://$siteDomain")
+        .set("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7")
+        .set("sec-fetch-site", "same-origin")
         .build()
     
     private fun rscRequestHeaders(): Headers = getRequestHeaders().newBuilder()
@@ -409,9 +410,10 @@ internal class VoraToon(context: MangaLoaderContext) :
         try {
             val pages = fetchChapterPages(chapterUrl)
             if (pages.isNotEmpty()) return pages
-        } catch (e: ParseException) {
-            throw e
-        } catch (_: Exception) {
+        } catch (e: Throwable) {
+            if (e is ParseException || e is CancellationException || e.javaClass.simpleName == "InteractiveActionRequiredException") {
+                throw e
+            }
         }
 
         val legacyId = storedChapter.toLongOrNull()
@@ -444,9 +446,10 @@ internal class VoraToon(context: MangaLoaderContext) :
                         try {
                             val pages = fetchChapterPages(legacyUrl)
                             if (pages.isNotEmpty()) return pages
-                        } catch (e: ParseException) {
-                            throw e
-                        } catch (_: Exception) {
+                        } catch (e: Throwable) {
+                            if (e is ParseException || e is CancellationException || e.javaClass.simpleName == "InteractiveActionRequiredException") {
+                                throw e
+                            }
                         }
                     }
                 }
@@ -456,9 +459,10 @@ internal class VoraToon(context: MangaLoaderContext) :
         try {
             val rscPages = fetchPagesFromRsc(chapterUrl)
             if (rscPages.isNotEmpty()) return rscPages
-        } catch (e: ParseException) {
-            throw e
-        } catch (_: Exception) {
+        } catch (e: Throwable) {
+            if (e is ParseException || e is CancellationException || e.javaClass.simpleName == "InteractiveActionRequiredException") {
+                throw e
+            }
         }
 
         return emptyList()
@@ -571,6 +575,18 @@ internal class VoraToon(context: MangaLoaderContext) :
         return DEFAULT_UNLOCK_ACTION_ID
     }
 
+    private fun requestCloudflareVerification(url: String, cause: Throwable? = null): Nothing {
+        try {
+            context.requestBrowserAction(this, url)
+        } catch (e: UnsupportedOperationException) {
+            throw ParseException(
+                "Verifikasi Cloudflare diperlukan untuk Voratoon. Buka di WebView lalu coba lagi.",
+                url,
+                cause ?: e,
+            )
+        }
+    }
+
     private suspend fun unlockPages(
         chapterUrl: String,
         ticket: String,
@@ -591,22 +607,19 @@ internal class VoraToon(context: MangaLoaderContext) :
             return null
         }
 
-        // 2. Solve Cloudflare Turnstile headlessly
+        // 2. Solve Cloudflare Turnstile headlessly (with short timeout so interactive challenges fall back promptly)
         val turnstileToken = runCatching {
             getTurnstileToken(
                 context = context,
                 url = chapterUrl,
                 siteKey = TURNSTILE_SITE_KEY,
                 action = "reader",
+                timeoutMs = 6_000L,
             )
         }.getOrNull()
 
         if (turnstileToken.isNullOrBlank()) {
-            runCatching { context.requestBrowserAction(this, chapterUrl) }
-            throw ParseException(
-                "Verifikasi Cloudflare diperlukan untuk Voratoon. Buka di WebView lalu coba lagi.",
-                chapterUrl,
-            )
+            requestCloudflareVerification(chapterUrl)
         }
 
         // 3. Second attempt with Turnstile token
@@ -617,11 +630,7 @@ internal class VoraToon(context: MangaLoaderContext) :
         }
 
         if (secondResponse?.contains("\"ok\":false") == true || secondResponse?.contains("\"challenge\"") == true) {
-            runCatching { context.requestBrowserAction(this, chapterUrl) }
-            throw ParseException(
-                "Verifikasi Cloudflare tidak valid atau kedaluwarsa. Buka di WebView lalu coba lagi.",
-                chapterUrl,
-            )
+            requestCloudflareVerification(chapterUrl)
         }
 
         return null
