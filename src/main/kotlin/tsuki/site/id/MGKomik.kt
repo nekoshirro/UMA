@@ -44,28 +44,10 @@ internal class MGKomik(context: MangaLoaderContext) :
                 )
 
         val builder = request.newBuilder()
-            .header("Sec-CH-UA-Model", "\"\"")
-            .header("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7")
             .header("Referer", "https://$domain/")
 
         if (isAjax) {
             builder.header("X-Requested-With", "XMLHttpRequest")
-                .header("Sec-Fetch-Dest", "empty")
-                .header("Sec-Fetch-Mode", "cors")
-                .header("Sec-Fetch-Site", "same-origin")
-                .header("Origin", "https://$domain")
-                .header("Priority", "u=1, i")
-                .removeHeader("Sec-Fetch-User")
-                .removeHeader("Upgrade-Insecure-Requests")
-        } else if (isSameHost) {
-            builder.header("Sec-Fetch-Dest", "document")
-                .header("Sec-Fetch-Mode", "navigate")
-                .header("Sec-Fetch-Site", "same-origin")
-                .header("Upgrade-Insecure-Requests", "1")
-                .header(
-                    "Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                )
         }
 
         return chain.proceed(builder.build())
