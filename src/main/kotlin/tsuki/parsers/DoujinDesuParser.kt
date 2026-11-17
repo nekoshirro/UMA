@@ -386,7 +386,7 @@ internal abstract class DoujinDesuParser(
                 }?.let { type -> addQueryParameter("type", type) }
             }
 
-            filter.states.oneOrThrowIfMany()?.let {
+            filter.states.singleOrNull()?.let {
                 when (it) {
                     MangaState.ONGOING -> "ongoing"
                     MangaState.FINISHED -> "completed"
